@@ -1,0 +1,19 @@
+name: Recognition Safety Gate
+
+on:
+  push:
+    branches: [main, "fix/**"]
+  pull_request:
+
+jobs:
+  recognition-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Dependency-free identity guard tests
+        run: python -m unittest backend_face.tests.test_recognition_guard -v
+      - name: Syntax check production recognition modules
+        run: python -m py_compile backend_face/recognition_guard.py backend_face/face_pipeline.py backend_face/fr1.py
