@@ -56,15 +56,27 @@ DEFAULT_SETTINGS = {
     "show_bounding_boxes": True,
     "unknown_detection_enabled": True,
     "long_distance_detection_enabled": True,
+    # Detection may still see small/far faces. Identity is withheld until the
+    # crop contains enough information for a conservative comparison.
     "min_face_size": 20,
-    # Runtime recognition tuning. These values are consumed by face_pipeline.py.
-    "detection_confidence_target": 0.35,
-    "recognition_tolerance": 0.55,
-    "long_range_tolerance": 0.60,
-    "known_capture_min_confidence": 0.35,
-    "unknown_capture_min_confidence": 0.45,
-    "known_capture_interval_seconds": 5.0,
-    "unknown_capture_interval_seconds": 12.0,
+    "min_identity_face_size": 56,
+    "known_evidence_min_face_size": 72,
+    "unknown_evidence_min_face_size": 48,
+    # Runtime recognition tuning. face_pipeline.py also enforces hard safety
+    # ceilings/floors so an old permissive tenant JSON cannot undo these guards.
+    "detection_confidence_target": 0.45,
+    "recognition_tolerance": 0.46,
+    "long_range_tolerance": 0.50,
+    "recognition_margin": 0.06,
+    "long_range_recognition_margin": 0.08,
+    "known_capture_min_confidence": 0.58,
+    "unknown_capture_min_confidence": 0.55,
+    "known_capture_interval_seconds": 30.0,
+    "unknown_capture_interval_seconds": 20.0,
+    "identity_confirmations": 2,
+    "identity_switch_confirmations": 4,
+    "evidence_min_quality": 0.30,
+    "evidence_min_observations": 2,
     # SMTP notifications (SuperAdmin only in UI/API).
     "smtp_host": "",
     "smtp_port": 587,

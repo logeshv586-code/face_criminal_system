@@ -1,63 +1,70 @@
 # fr1.py
 # -*- coding: utf-8 -*-
-"""
-Webcam / RTSP face detection (InsightFace SCRFD) + recognition (face_recognition).
-Configured for long-distance detection:
-  - INSIGHT_DET_SIZE bumped to (1280, 1280) — detects much smaller faces
-  - HOG face location model replaced with CNN for better long-distance results
-  - Embedding cache keyed by mtime so new training images are picked up instantly
+"""Reference-gallery loading and conservative standalone face matching.
+
+The live criminal-identification path uses :mod:`face_pipeline`.  This module is
+kept as the gallery/cache provider and as a small standalone diagnostic path.
+The gallery loader deliberately favours a small set of coherent, high-quality
+references over dozens of synthetic variants: ambiguous identities are safer as
+Unknown than as a wrong named match.
 """
 
-import os
+from __future__ import annotations
+
 import glob
-import time
-from typing import List, Tuple, Optional
+import os
+from collections import defaultdict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
-import numpy as np
 import face_recognition
+import numpy as np
 
 try:
     from insightface.app import FaceAnalysis
-except Exception as e:
-    raise ImportError("insightface is required. Install with: pip install insightface") from e
+except Exception as exc:  # pragma: no cover - runtime dependency
+    raise ImportError("insightface is required. Install with: pip install insightface") from exc
 
-# ─────────────────────── Configuration ─────────────────────────────────────
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CAMERA_INDEX = 0
 
-TOLERANCE            = 0.48   # tighter threshold → fewer false positives
-FRAME_DISPLAY_SCALE  = 1.0
+# Standalone diagnostic path.  Live tuning is enforced in face_pipeline.py.
+TOLERANCE = 0.46
+SECOND_PERSON_MARGIN = 0.06
+FRAME_DISPLAY_SCALE = 1.0
+INSIGHT_CTX = 0
+INSIGHT_DET_SIZE = (1280, 1280)
+MIN_FACE_PX = 20
+MIN_IDENTITY_FACE_PX = 56
 
-# ── Long-distance settings ──────────────────────────────────────────────────
-#   Larger det_size = InsightFace processes the image at higher resolution
-#   → detects smaller faces (people farther away from the camera).
-#   (640,640) is default; (1280,1280) detects roughly 4× smaller faces.
-INSIGHT_CTX      = 0               # -1=CPU, 0=GPU
-INSIGHT_DET_SIZE = (1280, 1280)    # ← CHANGED from (640,640) for long-distance
-
-# Minimum face pixel size to accept (long-distance people have small boxes)
-MIN_FACE_PX = 20   # ← was 50-60; now accepts faces 10 m+ away
+# Gallery hardening.  Registration historically generated 50 synthetic copies
+# from one photo.  Loading all of them makes one weak sample look like 50 votes.
+# We instead retain a compact, coherent reference set.
+MAX_REFERENCES_PER_PERSON = 12
+MIN_REFERENCES_PER_PERSON = 3
+MIN_REFERENCE_SIDE = 80
+MIN_REFERENCE_SHARPNESS = 18.0
+MIN_REFERENCE_MEAN = 28.0
+MAX_REFERENCE_MEAN = 230.0
+WITHIN_PERSON_MAX_DISTANCE = 0.42
+CROSS_PERSON_COLLISION_DISTANCE = 0.39
+CACHE_POLICY_VERSION = 2
 
 IGNORE_FOLDERS = {
-    "gallery", "auth", "camera_management",
-    "temp_bulk", "__pycache__", ".ipynb_checkpoints"
+    "gallery", "auth", "camera_management", "temp_bulk", "__pycache__", ".ipynb_checkpoints"
 }
-# ───────────────────────────────────────────────────────────────────────────
 
 
 def _load_npz_cache(cache_path: str) -> dict:
-    """Load a non-executable embedding cache.
-
-    The old implementation used pickle, which can execute code if a cache file
-    is replaced by an attacker. NPZ is loaded with allow_pickle=False and only
-    contains numeric/string arrays.
-    """
-    cache = {}
+    cache: Dict[str, dict] = {}
     if not os.path.exists(cache_path):
         return cache
     try:
         with np.load(cache_path, allow_pickle=False) as data:
+            version_arr = data.get("policy_version", np.array([0], dtype=np.int64))
+            version = int(np.asarray(version_arr).reshape(-1)[0]) if np.asarray(version_arr).size else 0
+            if version != CACHE_POLICY_VERSION:
+                return {}
             paths = data.get("paths", np.array([], dtype=str))
             mtimes = data.get("mtimes", np.array([], dtype=float))
             names = data.get("names", np.array([], dtype=str))
@@ -65,14 +72,17 @@ def _load_npz_cache(cache_path: str) -> dict:
             for path, mtime, name, enc in zip(paths.tolist(), mtimes.tolist(), names.tolist(), encodings):
                 cache.setdefault(path, {"mtime": float(mtime), "name": str(name), "encodings": []})
                 cache[path]["encodings"].append(np.asarray(enc, dtype=np.float64))
-    except Exception as e:
-        print(f"[WARN] Safe cache load failed, rebuilding: {e}")
+    except Exception as exc:
+        print(f"[WARN] Safe cache load failed, rebuilding: {exc}")
         return {}
     return cache
 
 
 def _save_npz_cache(cache_path: str, cache: dict) -> None:
-    paths, mtimes, names, encodings = [], [], [], []
+    paths: List[str] = []
+    mtimes: List[float] = []
+    names: List[str] = []
+    encodings: List[np.ndarray] = []
     for path, item in cache.items():
         for enc in item.get("encodings", []):
             arr = np.asarray(enc, dtype=np.float64).reshape(-1)
@@ -90,36 +100,130 @@ def _save_npz_cache(cache_path: str, cache: dict) -> None:
         mtimes=np.asarray(mtimes, dtype=np.float64),
         names=np.asarray(names, dtype=str),
         encodings=arr_enc,
+        policy_version=np.asarray([CACHE_POLICY_VERSION], dtype=np.int64),
     )
     os.replace(tmp, cache_path)
 
 
-def load_known_faces(data_dir: str,
-                     company_id: Optional[str] = None
-                     ) -> Tuple[List[np.ndarray], List[str]]:
-    """Load and safely cache 128-d face embeddings from a tenant gallery.
+def _reference_quality_ok(image_bgr: np.ndarray) -> bool:
+    """Reject tiny, extremely dark/bright or information-poor references."""
+    if image_bgr is None or image_bgr.size == 0:
+        return False
+    h, w = image_bgr.shape[:2]
+    if min(h, w) < MIN_REFERENCE_SIDE:
+        return False
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    mean = float(gray.mean())
+    sharpness = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return bool(
+        MIN_REFERENCE_MEAN <= mean <= MAX_REFERENCE_MEAN
+        and sharpness >= MIN_REFERENCE_SHARPNESS
+    )
 
-    Expected live-recognition structure:
-      data/gallery/<company>/<person>/1.jpg ... 50.jpg
 
-    The 50 registered/augmented reference images are treated as reference
-    samples for the identity. The recognition model itself is not retrained
-    every time a person is added; embeddings are computed/cached instead.
+def _encode_reference(img_path: str) -> Optional[np.ndarray]:
+    probe = cv2.imread(img_path)
+    if not _reference_quality_ok(probe):
+        return None
+
+    rgb = cv2.cvtColor(probe, cv2.COLOR_BGR2RGB)
+    locations = face_recognition.face_locations(rgb, model="hog")
+    if not locations:
+        locations = face_recognition.face_locations(rgb, model="cnn")
+    # Enrollment evidence must contain exactly one face.  A background face in
+    # a registered photo must never become a template for the named identity.
+    if len(locations) != 1:
+        return None
+
+    top, right, bottom, left = locations[0]
+    if min(right - left, bottom - top) < MIN_REFERENCE_SIDE // 2:
+        return None
+
+    encs = face_recognition.face_encodings(
+        rgb,
+        known_face_locations=locations,
+        num_jitters=2,
+        model="large",
+    )
+    if len(encs) != 1:
+        return None
+    return np.asarray(encs[0], dtype=np.float64)
+
+
+def _medoid(encodings: Sequence[np.ndarray]) -> np.ndarray:
+    if len(encodings) == 1:
+        return np.asarray(encodings[0], dtype=np.float64)
+    mat = np.vstack(encodings)
+    # Euclidean distances match face_recognition.face_distance.
+    dist = np.linalg.norm(mat[:, None, :] - mat[None, :, :], axis=2)
+    return mat[int(np.argmin(dist.mean(axis=1)))]
+
+
+def _coherent_subset(items: Sequence[Tuple[str, np.ndarray]]) -> List[Tuple[str, np.ndarray]]:
+    if not items:
+        return []
+    centre = _medoid([enc for _, enc in items])
+    ranked: List[Tuple[float, str, np.ndarray]] = []
+    for path, enc in items:
+        distance = float(np.linalg.norm(np.asarray(enc) - centre))
+        if distance <= WITHIN_PERSON_MAX_DISTANCE:
+            ranked.append((distance, path, enc))
+    ranked.sort(key=lambda row: (row[0], row[1]))
+    return [(path, enc) for _, path, enc in ranked[:MAX_REFERENCES_PER_PERSON]]
+
+
+def _find_colliding_people(grouped: Dict[str, List[Tuple[str, np.ndarray]]]) -> set[str]:
+    """Return identities whose gallery centres are dangerously close.
+
+    We fail closed and remove both identities from live known matching.  An
+    operator must re-enrol cleaner references before either can be named.
     """
-    known_encodings: List[np.ndarray] = []
-    known_names: List[str] = []
+    centres = {
+        person: _medoid([enc for _, enc in refs])
+        for person, refs in grouped.items()
+        if refs
+    }
+    people = sorted(centres)
+    collisions: set[str] = set()
+    for i, first in enumerate(people):
+        for second in people[i + 1:]:
+            distance = float(np.linalg.norm(centres[first] - centres[second]))
+            if distance < CROSS_PERSON_COLLISION_DISTANCE:
+                collisions.add(first)
+                collisions.add(second)
+                print(
+                    f"[SAFETY] Gallery collision {first!r} <-> {second!r} "
+                    f"(distance={distance:.3f}); both withheld from live identity matching"
+                )
+    return collisions
 
-    company_id_to_use = company_id or "default"
-    cache_path = os.path.join(data_dir, f"embeddings_cache_{company_id_to_use}.npz")
-    cache = _load_npz_cache(cache_path)
 
+def load_known_faces(
+    data_dir: str,
+    company_id: Optional[str] = None,
+) -> Tuple[List[np.ndarray], List[str]]:
+    """Load a conservative reference set from ``data/gallery/<tenant>``.
+
+    Safety rules:
+    * reject low-information/small or multi-face references;
+    * cap references so synthetic augmentation cannot create artificial votes;
+    * require multiple coherent templates per identity;
+    * withhold cross-person gallery collisions instead of guessing.
+    """
     if not os.path.isdir(data_dir):
         raise ValueError(f"Data directory does not exist: {data_dir}")
 
-    gallery_dir = os.path.join(data_dir, "gallery", company_id_to_use)
-    if not os.path.exists(gallery_dir):
-        print(f"[WARN] Gallery not found for company '{company_id_to_use}': {gallery_dir}")
+    company = str(company_id or "default")
+    gallery_dir = os.path.join(data_dir, "gallery", company)
+    if not os.path.isdir(gallery_dir):
+        print(f"[WARN] Gallery not found for company '{company}': {gallery_dir}")
         return [], []
+
+    cache_path = os.path.join(data_dir, f"embeddings_cache_{company}.npz")
+    cache = _load_npz_cache(cache_path)
+    current_files: set[str] = set()
+    grouped: Dict[str, List[Tuple[str, np.ndarray]]] = defaultdict(list)
+    new_computations = 0
 
     person_dirs = [
         d for d in sorted(os.listdir(gallery_dir))
@@ -127,227 +231,177 @@ def load_known_faces(data_dir: str,
     ]
     print(f"[INFO] {len(person_dirs)} person(s) in {gallery_dir}")
 
-    current_files = set()
-    new_computations = 0
-
     for person in person_dirs:
-        files = [
+        files = sorted(
             f for f in glob.glob(os.path.join(gallery_dir, person, "*"))
             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp"))
-        ]
-        # Keep deterministic ordering and cap the reference set to 50 images.
-        files = sorted(files)[:50]
-        for img_path in files:
+        )
+        # Scan a bounded number.  Old galleries often contain 50 variants from
+        # one source; quality/cohesion filtering happens below.
+        for img_path in files[:50]:
             current_files.add(img_path)
             try:
                 mtime = os.path.getmtime(img_path)
                 item = cache.get(img_path)
+                enc: Optional[np.ndarray] = None
                 if item and abs(float(item.get("mtime", 0)) - float(mtime)) < 0.000001:
-                    for enc in item.get("encodings", []):
-                        known_encodings.append(np.asarray(enc, dtype=np.float64))
-                        known_names.append(person)
-                    continue
+                    cached = item.get("encodings", [])
+                    if cached:
+                        enc = np.asarray(cached[0], dtype=np.float64)
+                else:
+                    enc = _encode_reference(img_path)
+                    if enc is None:
+                        cache.pop(img_path, None)
+                        continue
+                    cache[img_path] = {"mtime": mtime, "encodings": [enc], "name": person}
+                    new_computations += 1
+                if enc is not None and enc.size == 128:
+                    grouped[person].append((img_path, enc))
+            except Exception as exc:
+                print(f"[WARN] Reference skipped {img_path}: {exc}")
+                cache.pop(img_path, None)
 
-                probe = cv2.imread(img_path)
-                if probe is None or probe.size == 0:
-                    cache.pop(img_path, None)
-                    continue
-
-                img = face_recognition.load_image_file(img_path)
-                locations = face_recognition.face_locations(img, model="hog")
-                if not locations:
-                    locations = face_recognition.face_locations(img, model="cnn")
-                if not locations:
-                    print(f"[WARN] No face in {img_path} — skipping")
-                    cache.pop(img_path, None)
-                    continue
-
-                encs = face_recognition.face_encodings(
-                    img,
-                    known_face_locations=locations,
-                    num_jitters=2,
-                    model='large'
-                )
-                if not encs:
-                    cache.pop(img_path, None)
-                    continue
-
-                # Registration images are expected to be single-person crops.
-                # Keep the first encoding only so accidental background faces do
-                # not contaminate the registered identity.
-                enc = np.asarray(encs[0], dtype=np.float64)
-                known_encodings.append(enc)
-                known_names.append(person)
-                cache[img_path] = {"mtime": mtime, "encodings": [enc], "name": person}
-                new_computations += 1
-            except Exception as e:
-                print(f"[ERROR] Failed on {img_path}: {e}")
-
-    for stale_path in [p for p in cache if p not in current_files]:
+    # Drop stale cached references.
+    for stale_path in [path for path in cache if path not in current_files]:
         cache.pop(stale_path, None)
+
+    coherent: Dict[str, List[Tuple[str, np.ndarray]]] = {}
+    for person, refs in grouped.items():
+        filtered = _coherent_subset(refs)
+        if len(filtered) < MIN_REFERENCES_PER_PERSON:
+            print(
+                f"[SAFETY] {person!r} has only {len(filtered)} coherent reference(s); "
+                "identity withheld until re-enrolment provides multiple clear samples"
+            )
+            continue
+        coherent[person] = filtered
+
+    collisions = _find_colliding_people(coherent)
+    known_encodings: List[np.ndarray] = []
+    known_names: List[str] = []
+    for person in sorted(coherent):
+        if person in collisions:
+            continue
+        for _, enc in coherent[person]:
+            known_encodings.append(np.asarray(enc, dtype=np.float64))
+            known_names.append(person)
 
     try:
         _save_npz_cache(cache_path, cache)
-    except Exception as e:
-        print(f"[ERROR] Could not save safe cache: {e}")
+    except Exception as exc:
+        print(f"[WARN] Could not save safe cache: {exc}")
 
-    # Remove the old executable pickle cache after successful conversion path.
-    legacy = os.path.join(data_dir, f"embeddings_cache_{company_id_to_use}.pkl")
+    legacy = os.path.join(data_dir, f"embeddings_cache_{company}.pkl")
     if os.path.exists(legacy):
         try:
             os.remove(legacy)
         except OSError:
             pass
 
-    print(f"[INFO] Total encodings: {len(known_encodings)} | New: {new_computations}")
+    print(
+        f"[INFO] Loaded {len(known_encodings)} safe reference embeddings "
+        f"for {len(set(known_names))} identities | New computations: {new_computations}"
+    )
     return known_encodings, known_names
 
-def prepare_insightface(ctx: int = INSIGHT_CTX,
-                        det_size: Tuple[int, int] = INSIGHT_DET_SIZE) -> FaceAnalysis:
-    """Prepare InsightFace detector for long-distance use."""
-    try:
-        import onnxruntime as ort
-        print("[INFO] ONNX providers:", ort.get_available_providers())
-    except Exception:
-        pass
 
-    app = FaceAnalysis(allowed_modules=['detection'])
+def prepare_insightface(
+    ctx: int = INSIGHT_CTX,
+    det_size: Tuple[int, int] = INSIGHT_DET_SIZE,
+) -> FaceAnalysis:
+    app = FaceAnalysis(allowed_modules=["detection"])
     app.prepare(ctx_id=ctx, det_size=det_size)
     print(f"[INFO] InsightFace ready | ctx={ctx} | det_size={det_size}")
     return app
 
 
-def recognize_frame_insight(frame_bgr: np.ndarray,
-                             app: FaceAnalysis,
-                             known_encodings: List[np.ndarray],
-                             known_names: List[str]) -> np.ndarray:
-    """
-    Run long-distance detection + recognition on a single frame.
-    Upscales small face crops before encoding for better accuracy.
-    """
+def _conservative_name(
+    encoding: np.ndarray,
+    known_encodings: Sequence[np.ndarray],
+    known_names: Sequence[str],
+) -> Tuple[str, Optional[float]]:
+    if not known_encodings:
+        return "Unknown", None
+    distances = face_recognition.face_distance(list(known_encodings), encoding)
+    per_person: Dict[str, float] = {}
+    for name, dist in zip(known_names, distances):
+        per_person[name] = min(per_person.get(name, 999.0), float(dist))
+    ranked = sorted(per_person.items(), key=lambda item: item[1])
+    if not ranked or ranked[0][1] > TOLERANCE:
+        return "Unknown", ranked[0][1] if ranked else None
+    second = ranked[1][1] if len(ranked) > 1 else 1.0
+    if second - ranked[0][1] < SECOND_PERSON_MARGIN:
+        return "Unknown", ranked[0][1]
+    return ranked[0][0], ranked[0][1]
+
+
+def recognize_frame_insight(
+    frame_bgr: np.ndarray,
+    app: FaceAnalysis,
+    known_encodings: List[np.ndarray],
+    known_names: List[str],
+) -> np.ndarray:
+    """Standalone diagnostic renderer; uncertain/small faces remain Unknown."""
     if frame_bgr is None:
         return frame_bgr
-
-    orig_h, orig_w = frame_bgr.shape[:2]
-
-    # CLAHE to help with dim / far-away cameras
-    lab = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-    enhanced = cv2.cvtColor(cv2.merge([clahe.apply(l), a, b]), cv2.COLOR_LAB2BGR)
-
-    faces = app.get(enhanced)
-
-    for f in faces:
-        try:
-            x1, y1, x2, y2 = map(int, f.bbox)
-        except Exception:
-            bx = f.bbox
-            if len(bx) < 4:
-                continue
-            x1, y1, x2, y2 = int(bx[0]), int(bx[1]), int(bx[2]), int(bx[3])
-
-        x1 = max(0, min(orig_w - 1, x1))
-        x2 = max(0, min(orig_w - 1, x2))
-        y1 = max(0, min(orig_h - 1, y1))
-        y2 = max(0, min(orig_h - 1, y2))
-
+    h, w = frame_bgr.shape[:2]
+    for face in app.get(frame_bgr):
+        bbox = getattr(face, "bbox", None)
+        if bbox is None or len(bbox) < 4:
+            continue
+        x1, y1, x2, y2 = map(int, bbox[:4])
+        x1, x2 = max(0, x1), min(w - 1, x2)
+        y1, y2 = max(0, y1), min(h - 1, y2)
         fw, fh = x2 - x1, y2 - y1
         if fw < MIN_FACE_PX or fh < MIN_FACE_PX:
             continue
 
-        # Crop and upscale small faces before encoding
-        crop_bgr = frame_bgr[y1:y2, x1:x2]
-        target   = 112
-        short    = min(fw, fh)
-        if short < target:
-            scale    = target / short
-            crop_bgr = cv2.resize(
-                crop_bgr,
-                (max(target, int(fw * scale)), max(target, int(fh * scale))),
-                interpolation=cv2.INTER_LANCZOS4
-            )
-
-        crop_rgb  = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-        ch, cw    = crop_rgb.shape[:2]
-        crop_loc  = [(0, cw - 1, ch - 1, 0)]
-
-        try:
-            encs = face_recognition.face_encodings(
-                crop_rgb,
-                known_face_locations=crop_loc,
-                num_jitters=1,
-                model='large'
-            )
-        except Exception:
-            encs = []
-
         name = "Unknown"
-        dist = None
-
-        if encs and known_encodings:
-            dists    = face_recognition.face_distance(known_encodings, encs[0])
-            best_idx = int(np.argmin(dists))
-            best_d   = float(dists[best_idx])
-            dist     = best_d
-            if best_d <= TOLERANCE:
-                name = known_names[best_idx]
+        distance: Optional[float] = None
+        if min(fw, fh) >= MIN_IDENTITY_FACE_PX:
+            crop = frame_bgr[y1:y2, x1:x2]
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            ch, cw = rgb.shape[:2]
+            encs = face_recognition.face_encodings(
+                rgb,
+                known_face_locations=[(0, cw - 1, ch - 1, 0)],
+                num_jitters=1,
+                model="large",
+            )
+            if encs:
+                name, distance = _conservative_name(encs[0], known_encodings, known_names)
 
         color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
         cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), color, 2)
-
-        conf    = getattr(f, "det_score", None) or getattr(f, "score", None)
-        parts   = [name]
-        if dist  is not None: parts.append(f"d={dist:.2f}")
-        if conf  is not None: parts.append(f"det={conf:.2f}")
-        parts.append(f"{fw}x{fh}px")   # show face size for distance debugging
-
-        label   = " | ".join(parts)
-        label_y = y1 - 10 if y1 - 10 > 10 else y2 + 20
-        cv2.putText(frame_bgr, label, (x1, label_y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-
+        label = name + (f" | d={distance:.2f}" if distance is not None else "")
+        cv2.putText(
+            frame_bgr,
+            label,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
     return frame_bgr
 
 
-def main():
-    print("[INFO] Loading known faces ...")
+def main() -> None:  # pragma: no cover - manual diagnostic
     known_encodings, known_names = load_known_faces(DATA_DIR)
-    if not known_encodings:
-        print("[ERROR] No known faces found. Add images to data/gallery/<company>/<name>/")
-        return
-
-    app = prepare_insightface(ctx=INSIGHT_CTX, det_size=INSIGHT_DET_SIZE)
-
-    print(f"[INFO] Opening camera {CAMERA_INDEX} ...")
+    app = prepare_insightface()
     cap = cv2.VideoCapture(CAMERA_INDEX, cv2.CAP_DSHOW)
     if not cap.isOpened():
-        print(f"[ERROR] Cannot open camera {CAMERA_INDEX}")
-        return
-
-    # High resolution capture for maximum long-distance detection
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
-    cap.set(cv2.CAP_PROP_FPS, 30)
-
-    print("[INFO] Press 'q' to quit.")
+        raise RuntimeError(f"Cannot open camera {CAMERA_INDEX}")
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                time.sleep(0.01)
+            ok, frame = cap.read()
+            if not ok or frame is None:
                 continue
-
             annotated = recognize_frame_insight(frame, app, known_encodings, known_names)
-
-            if FRAME_DISPLAY_SCALE != 1.0:
-                annotated = cv2.resize(annotated, (0, 0), fx=FRAME_DISPLAY_SCALE, fy=FRAME_DISPLAY_SCALE)
-
-            cv2.imshow("Long-Distance Face Recognition | press Q to quit", annotated)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            cv2.imshow("Conservative Face Recognition | Q to quit", annotated)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-    except KeyboardInterrupt:
-        print("\n[INFO] Interrupted")
     finally:
         cap.release()
         cv2.destroyAllWindows()
