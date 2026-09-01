@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Conservative live FRS: detect far faces, name only strong/confirmed ones."""
-import logging, os, threading, time
+import json, logging, os, threading, time
 from collections import defaultdict
 from typing import Any, Dict, List, Optional, Tuple
 import cv2, face_recognition, numpy as np
 from insightface.app import FaceAnalysis
+from identity_registry import identity_is_registered, registered_identity_keys
 from recognition_guard import UNKNOWN, stable_known_evidence_key, update_identity_state
 from save_face import save_face_image
 
@@ -17,6 +18,7 @@ runtime_profile={"device":"uninitialized","ctx":-1,"det_size":None,"process_ever
 company_embeddings={}; person_tracking=defaultdict(dict); track_id_counter=defaultdict(int)
 best_evidence=defaultdict(dict); unknown_clusters=defaultdict(dict); unknown_cluster_counter=defaultdict(int)
 embedding_lock=threading.RLock(); tracking_lock=threading.RLock(); _settings_lock=threading.RLock(); _settings_cache={}
+_registry_lock=threading.RLock(); _registry_cache={}
 
 def _f(n,d,lo,hi):
     try:return max(lo,min(hi,float(os.getenv(n,str(d)))))
@@ -60,6 +62,39 @@ def get_runtime_settings(company_id=None):return dict(_settings(str(company_id o
 def clear_runtime_settings_cache(company_id=None):
     with _settings_lock:
         _settings_cache.clear() if company_id is None else _settings_cache.pop(str(company_id or "default"),None)
+
+def _registered_ids(company):
+    """Return metadata-authorized identity keys for a tenant, or None for legacy fallback."""
+    key=str(company or "default"); path=os.path.join(data_directory,"metadata.json") if data_directory else ""
+    if not path or not os.path.exists(path):return None
+    try:sig=(os.path.getmtime(path),os.path.getsize(path))
+    except OSError:return None
+    with _registry_lock:
+        c=_registry_cache.get(key)
+        if c and c.get("sig")==sig:return set(c.get("ids",set()))
+    try:
+        with open(path,"r",encoding="utf-8") as f:meta=json.load(f)
+        ids=registered_identity_keys(meta,key)
+        with _registry_lock:_registry_cache[key]={"sig":sig,"ids":set(ids)}
+        return set(ids)
+    except Exception as e:
+        log.warning("Unable to read registration metadata for %s: %s",key,e)
+        with _registry_lock:
+            c=_registry_cache.get(key)
+            return set(c.get("ids",set())) if c else None
+
+def _reset_track_identity(t):
+    if not t:return
+    t["confirmed_name"]=UNKNOWN; t["display_name"]=UNKNOWN; t["pending_name"]=None; t["pending_hits"]=0; t["identity_conflict"]=False; t["last_verified_at"]=0
+    t.pop("encoding",None)
+
+def _filter_registered_entry(company,x):
+    allowed=_registered_ids(company)
+    if allowed is None:return x
+    e=[]; n=[]
+    for enc,name in zip(x.get("encodings",[]),x.get("names",[])):
+        if identity_is_registered(name,allowed):e.append(enc); n.append(name)
+    return {"encodings":e,"names":n,"last_loaded":x.get("last_loaded",0)}
 
 def _iou(a,b):
     x1,y1,x2,y2=max(a[0],b[0]),max(a[1],b[1]),min(a[2],b[2]),min(a[3],b[3])
@@ -164,19 +199,21 @@ def init(data_dir,ctx=-1,det_size=(640,640),use_dual_gpu=True):
     runtime_profile.update({"device":dev,"ctx":c,"det_size":ds,"process_every_n":_i("FACE_PROCESS_EVERY_N_GPU" if dev=="gpu" else "FACE_PROCESS_EVERY_N_CPU",2 if dev=="gpu" else 5,1,30)})
 def get_runtime_profile():return dict(runtime_profile)
 def clear_company_embeddings_cache(company_id):
-    with embedding_lock:company_embeddings.pop(str(company_id or "default"),None)
+    key=str(company_id or "default")
+    with embedding_lock:company_embeddings.pop(key,None)
+    with _registry_lock:_registry_cache.pop(key,None)
 def load_company_embeddings(company_id):
     c=str(company_id or "default")
     with embedding_lock:
         x=company_embeddings.get(c)
-        if x and time.time()-x.get("last_loaded",0)<300:return x
+        if x and time.time()-x.get("last_loaded",0)<300:return _filter_registered_entry(c,x)
     try:
         from fr1 import load_known_faces
         e,n=load_known_faces(data_directory,company_id=c)
     except Exception as z:log.error("gallery %s: %s",c,z); e,n=[],[]
     x={"encodings":e,"names":n,"last_loaded":time.time()}
     with embedding_lock:company_embeddings[c]=x
-    return x
+    return _filter_registered_entry(c,x)
 
 def process_frame(frame_bgr,force_process=False,stream_id=None,company_id=None):
     del force_process
@@ -190,7 +227,7 @@ def process_frame(frame_bgr,force_process=False,stream_id=None,company_id=None):
         except:pass
     company=str(company_id or "default"); s=_settings(company)
     if not s["face_recognition_enabled"]:return frame_bgr,[]
-    minface=max(12,int(s["min_face_size"])); minface=max(minface,48) if not s["long_distance_detection_enabled"] else minface; target=max(.2,float(s["detection_confidence_target"])); g=load_company_embeddings(company); known,names=g["encodings"],g["names"]
+    minface=max(12,int(s["min_face_size"])); minface=max(minface,48) if not s["long_distance_detection_enabled"] else minface; target=max(.2,float(s["detection_confidence_target"])); g=load_company_embeddings(company); known,names=g["encodings"],g["names"]; allowed=_registered_ids(company)
     sid=str(stream_id or "default"); now=time.time(); _cleanup(sid,now)
     h,w=frame_bgr.shape[:2]; raw=[]
     for f in app.get(frame_bgr):
@@ -201,10 +238,15 @@ def process_frame(frame_bgr,force_process=False,stream_id=None,company_id=None):
     tracks=person_tracking[sid] if stream_id else {}; out=[]
     for d in _dedupe(raw):
         b,dc=d["bbox"],d["det_conf"]; x1,y1,x2,y2=b; fw,fh=x2-x1,y2-y1; size=min(fw,fh); c=frame_bgr[y1:y2,x1:x2]; tid=_track(b,tracks) if stream_id else None; t=tracks.get(tid) if tid is not None else None; enc=None
+        if t is not None:
+            previous=str(t.get("confirmed_name") or t.get("display_name") or UNKNOWN)
+            if previous!=UNKNOWN and not identity_is_registered(previous,allowed):_reset_track_identity(t)
         verify=t is None or now-float(t.get("last_verified_at",0))>=.8 or (t.get("bbox") and _iou(t["bbox"],b)<.12)
         if not verify:name=str(t.get("confirmed_name") or UNKNOWN); conf=float(t.get("conf",dc)); enc=t.get("encoding")
         else:
             enc=_encode(frame_bgr,b,size); cand,conf,dist=_match(enc,known,names,size,dc,s); state=t if t is not None else {}; name=update_identity_state(state,cand,candidate_is_strong=cand!=UNKNOWN and dist is not None,confirm_hits=int(s["identity_confirmations"]),switch_hits=int(s["identity_switch_confirmations"])); state["last_verified_at"]=now; t=state
+        if name!=UNKNOWN and not identity_is_registered(name,allowed):
+            _reset_track_identity(t); name=UNKNOWN; conf=dc; enc=None
         if stream_id:
             if tid is None:track_id_counter[sid]+=1; tid=track_id_counter[sid]; tracks[tid]=t or {}; t=tracks[tid]
             t.update({"bbox":b,"last_seen":now,"display_name":name,"conf":conf,"det_conf":dc});
@@ -215,6 +257,7 @@ def process_frame(frame_bgr,force_process=False,stream_id=None,company_id=None):
             if chosen is not None:
                 cam,comp=_camera(stream_id,company); crop=chosen.copy(); label=name if known_person else UNKNOWN; cf=conf if known_person else dc
                 def _save(crop=crop,label=label,cf=cf,cool=cool,cam=cam,comp=comp,key=key):
+                    if label!=UNKNOWN and not identity_is_registered(label,_registered_ids(comp)):return
                     save_face_image(face_crop_bgr=crop,label=label,confidence=cf,min_interval=cool,source="stream",jpeg_quality=96,target_width=320,max_upscale=3.,camera_name=cam,company_id=comp,identity_key=key,min_known_confidence=float(s["known_capture_min_confidence"]),min_unknown_confidence=float(s["unknown_capture_min_confidence"]))
                 threading.Thread(target=_save,daemon=True).start()
         out.append({"name":name,"conf":conf if known_person else dc,"bbox":b,"face_size_px":(fw,fh),"track_id":tid,"quality":round(q,3),"review_required":known_person})
@@ -222,7 +265,9 @@ def process_frame(frame_bgr,force_process=False,stream_id=None,company_id=None):
         active=[]
         for tid,t in tracks.items():
             if now-float(t.get("last_seen",0))<MAX_TRACK_AGE_SECONDS and t.get("bbox"):
-                b=t["bbox"]; n=str(t.get("display_name") or t.get("confirmed_name") or UNKNOWN); active.append({"name":n,"conf":float(t.get("conf",t.get("det_conf",0))),"bbox":b,"track_id":tid,"face_size_px":(b[2]-b[0],b[3]-b[1]),"is_persisted":now-float(t.get("last_seen",0))>.1,"review_required":n!=UNKNOWN})
+                b=t["bbox"]; n=str(t.get("display_name") or t.get("confirmed_name") or UNKNOWN)
+                if n!=UNKNOWN and not identity_is_registered(n,allowed):_reset_track_identity(t); n=UNKNOWN
+                active.append({"name":n,"conf":float(t.get("conf",t.get("det_conf",0))),"bbox":b,"track_id":tid,"face_size_px":(b[2]-b[0],b[3]-b[1]),"is_persisted":now-float(t.get("last_seen",0))>.1,"review_required":n!=UNKNOWN})
         return frame_bgr,_dedupe(active)
     return frame_bgr,_dedupe(out)
 
