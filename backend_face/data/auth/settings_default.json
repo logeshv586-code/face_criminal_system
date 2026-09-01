@@ -7,6 +7,9 @@
   "unknown_detection_enabled": true,
   "long_distance_detection_enabled": true,
   "min_face_size": 20,
+  "min_identity_face_size": 56,
+  "known_evidence_min_face_size": 72,
+  "unknown_evidence_min_face_size": 48,
   "attendance": {
     "punch_in": "09:30",
     "punch_out": "18:00",
@@ -15,11 +18,17 @@
     "min_hours_present": 4.0,
     "overtime_after": 9.0
   },
-  "detection_confidence_target": 0.35,
-  "recognition_tolerance": 0.55,
-  "long_range_tolerance": 0.6,
-  "known_capture_min_confidence": 0.35,
-  "unknown_capture_min_confidence": 0.45,
-  "known_capture_interval_seconds": 5.0,
-  "unknown_capture_interval_seconds": 12.0
+  "detection_confidence_target": 0.45,
+  "recognition_tolerance": 0.46,
+  "long_range_tolerance": 0.50,
+  "recognition_margin": 0.06,
+  "long_range_recognition_margin": 0.08,
+  "known_capture_min_confidence": 0.58,
+  "unknown_capture_min_confidence": 0.55,
+  "known_capture_interval_seconds": 30.0,
+  "unknown_capture_interval_seconds": 20.0,
+  "identity_confirmations": 2,
+  "identity_switch_confirmations": 4,
+  "evidence_min_quality": 0.30,
+  "evidence_min_observations": 2
 }
