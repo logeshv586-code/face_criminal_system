@@ -94,13 +94,6 @@ const AnimatedLoginPage = () => {
           setIsLoading(false);
           resetAnimation();
         }, 3000);
-
-        // Show specific error message from backend
-        if (result.error) {
-          alert(`Authentication failed: ${result.error}`);
-        } else {
-          alert('Authentication failed. Please check your credentials and try again.');
-        }
       }
     } catch (error) {
       // Network/server error
@@ -112,8 +105,6 @@ const AnimatedLoginPage = () => {
         setIsLoading(false);
         resetAnimation();
       }, 3000);
-
-      alert('Unable to connect to authentication server. Please try again later.');
     }
   };
 

@@ -450,7 +450,7 @@ const RegistrationWidget = () => {
               style={{ maxWidth: '300px' }}
             />
             <span style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
-              {employees.filter(e => e.name.toLowerCase().includes(searchTerm.toLowerCase()) || (e.emp_id && e.emp_id.toLowerCase().includes(searchTerm.toLowerCase()))).length} records
+              {employees.filter(e => (e.name || '').toLowerCase().includes(searchTerm.toLowerCase()) || (e.emp_id && e.emp_id.toLowerCase().includes(searchTerm.toLowerCase()))).length} records
             </span>
             <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px' }}>
               <button className="btn-submit-clean" onClick={async () => {

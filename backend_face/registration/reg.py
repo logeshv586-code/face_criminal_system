@@ -1128,6 +1128,8 @@ async def get_gallery(request: Request, name: Optional[str] = None, category: Op
     """Get gallery data with image filenames, optionally filtered by name and category"""
     try:
         persons = {}
+        current_user = request.scope.get("user", {})
+        company_id = current_user.get("company_id")
 
         if os.path.exists(METADATA_FILE):
             with open(METADATA_FILE, 'r') as f:
@@ -1146,8 +1148,6 @@ async def get_gallery(request: Request, name: Optional[str] = None, category: Op
                         persons[k] = v
             
             # Filter by company_id
-            current_user = request.scope.get("user", {})
-            company_id = current_user.get("company_id")
             if company_id:
                 persons = {k: v for k, v in persons.items() if v.get("company_id") == company_id}
             elif current_user.get("role") != "SuperAdmin":

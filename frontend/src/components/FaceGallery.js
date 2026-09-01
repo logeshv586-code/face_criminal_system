@@ -267,6 +267,7 @@ const FaceGallery = () => {
         <div className="empty-state" style={{ borderColor: '#ef4444', color: '#ef4444' }}>
           <p>{error}</p>
           <button onClick={loadData} className="refresh-btn" style={{ marginTop: '16px' }}>
+            <RefreshCw size={18} />
             Try Again
           </button>
         </div>

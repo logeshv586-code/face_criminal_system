@@ -19,8 +19,8 @@ The push-ready package removes customer accounts and tokens. Create the first Su
 
 ```powershell
 $body = @{
-  username = "superadmin"
-  password = "ChangeThisStrongPassword!"
+  username = "admin"
+  password = "password123"
 } | ConvertTo-Json
 
 Invoke-RestMethod `
